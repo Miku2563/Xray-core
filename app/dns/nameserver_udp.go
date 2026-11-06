@@ -457,7 +457,7 @@ func withEDNS0Size(msg *dnsmessage.Message, size uint16) (*dnsmessage.Message, b
 
 	if !found {
 		opt := dnsmessage.Resource{Body: &dnsmessage.OPTResource{}}
-		common.Must(opt.Header.SetEDNS0(size, 0xfe00, true))
+		common.Must(opt.Header.SetEDNS0(int(size), 0, false))
 		out.Additionals = append(out.Additionals, opt)
 	}
 	return &out, true
