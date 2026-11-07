@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	stdnet "net"
+	stderrors "errors"
+	"hash/fnv"
 	"io"
+	"mime"
+	stdnet "net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -13,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common"
@@ -38,6 +42,11 @@ const (
 	dohMaxAttempts     = 2
 	dohDefaultTimeout  = 5 * time.Second
 
+	// 同一服务器同时在途的请求数上限。
+	// 服务端 MAX_CONCURRENT_STREAMS 通常 ≥100，因此最多同时 1~2 条 h2 连接，
+	// 不会因突发流量无限开连接。等待受 ctx deadline 约束。
+	dohMaxInflight = 128
+
 	// 预热相关参数
 	dohWarmupName        = "."              // 根域 NS 查询：报文小，几乎所有解析器都能应答
 	dohWarmupTimeout     = 5 * time.Second  // 单次预热超时
@@ -48,13 +57,25 @@ const (
 
 // dohConn 封装一组 HTTP/2 连接池。网络切换时整体替换，而不是修改其内部状态。
 type dohConn struct {
-	client    *http.Client
 	transport *http2.Transport
 }
+
+// dohDialError 标记拨号阶段（含 TLS 握手、ALPN 校验）的错误。
+// 这类错误立刻重试通常没有意义。
+type dohDialError struct{ err error }
+
+func (e *dohDialError) Error() string { return e.err.Error() }
+func (e *dohDialError) Unwrap() error { return e.err }
 
 // DoHNameServer implemented DNS over HTTPS (RFC8484) Wire Format,
 // which is compatible with traditional dns over udp(RFC1035),
 // thus most of the DOH implementation is copied from udpns.go
+//
+// 资源模型：
+//   - 同时在途请求 ≤ dohMaxInflight，h2 连接数随之受限。
+//   - 网络监听使用全局唯一的 goroutine，订阅者以弱引用持有，
+//     即使实例没有被 Close 也会被自动剔除，不会泄漏。
+//   - 预热同一时刻最多一个。
 type DoHNameServer struct {
 	cacheController *CacheController
 	dohURL          string
@@ -63,15 +84,19 @@ type DoHNameServer struct {
 	dispatcher      routing.Dispatcher
 	h2c             bool
 
-	conn atomic.Pointer[dohConn] // 当前使用的 HTTP 客户端，可原子替换
+	conn     atomic.Pointer[dohConn] // 当前使用的 HTTP/2 连接池，可原子替换
+	inflight chan struct{}
 
 	ctx       context.Context
 	cancel    context.CancelFunc
 	startOnce sync.Once
 	closeOnce sync.Once
 
-	warmMu   sync.Mutex
-	lastWarm time.Time
+	warmMu     sync.Mutex
+	lastWarm   time.Time
+	warmBusy   bool
+	warmSeq    uint64
+	warmCancel context.CancelFunc
 }
 
 // NewDoHNameServer creates DOH/DOHL client object for remote/local resolving.
@@ -94,6 +119,7 @@ func NewDoHNameServer(serverURL *url.URL, dispatcher routing.Dispatcher, h2c boo
 		clientIP:        clientIP,
 		dispatcher:      dispatcher,
 		h2c:             h2c,
+		inflight:        make(chan struct{}, dohMaxInflight),
 		ctx:             ctx,
 		cancel:          cancel,
 	}
@@ -101,12 +127,12 @@ func NewDoHNameServer(serverURL *url.URL, dispatcher routing.Dispatcher, h2c boo
 	return s
 }
 
-// Start 由 DNS Client 在启动阶段调用：后台预热连接并开启网络变化监听。
+// Start 由 DNS Client 在启动阶段调用：后台预热连接并订阅网络变化。
 // 预热在后台进行，失败不影响服务可用性。
 func (s *DoHNameServer) Start() {
 	s.startOnce.Do(func() {
-		go s.Warmup(s.ctx)
-		go watchNetwork(s.ctx, dohNetworkPollPeriod, s.OnNetworkChanged)
+		sharedNetWatcher.subscribe(s)
+		go s.warm(s.ctx, false)
 	})
 }
 
@@ -117,40 +143,60 @@ func (s *DoHNameServer) Warmup(ctx context.Context) {
 
 // OnNetworkChanged 在网络切换时调用（如 Wi-Fi 与蜂窝之间切换、出口 IP 变化）。
 // 替换连接池以丢弃依附于旧网络的连接，然后强制重新预热。
+// 平台层（如 Android）也可以直接调用它。
 func (s *DoHNameServer) OnNetworkChanged() {
+	if s.ctx.Err() != nil {
+		return
+	}
 	s.resetTransport()
 	go s.warm(s.ctx, true)
 }
 
 // warm 发送一次轻量查询以建立连接。响应被丢弃，不写入缓存。
+// 同一时刻只保留一个预热：强制预热会取消正在进行的预热，非强制预热在有预热进行时直接跳过。
 func (s *DoHNameServer) warm(parent context.Context, force bool) {
-	s.warmMu.Lock()
-	if !force && time.Since(s.lastWarm) < dohWarmupMinInterval {
-		s.warmMu.Unlock()
-		return
-	}
-	s.lastWarm = time.Now()
-	s.warmMu.Unlock()
-
 	if parent.Err() != nil {
 		return
 	}
 
+	s.warmMu.Lock()
+	if !force && (s.warmBusy || time.Since(s.lastWarm) < dohWarmupMinInterval) {
+		s.warmMu.Unlock()
+		return
+	}
+	if s.warmCancel != nil {
+		s.warmCancel() // 取消旧预热（它可能还在使用旧网络的连接）
+	}
 	ctx, cancel := context.WithTimeout(parent, dohWarmupTimeout)
-	defer cancel()
-	ctx = s.reqContext(ctx)
+	s.warmSeq++
+	seq := s.warmSeq
+	s.warmCancel = cancel
+	s.warmBusy = true
+	s.lastWarm = time.Now()
+	s.warmMu.Unlock()
 
+	defer func() {
+		cancel()
+		s.warmMu.Lock()
+		if s.warmSeq == seq { // 没有被更新的预热接管
+			s.warmBusy = false
+			s.warmCancel = nil
+		}
+		s.warmMu.Unlock()
+	}()
+
+	ctx = s.reqContext(ctx)
 	msg := warmupMessage()
 	b, err := dns.PackMessage(&msg)
 	if err != nil {
 		errors.LogInfoInner(ctx, err, "DNS: failed to pack warmup query for ", s.Name())
 		return
 	}
-	defer b.Release()
+	payload := bytes.Clone(b.Bytes()) // 独立副本，池化缓冲区立即归还
+	b.Release()
 
 	start := time.Now()
-	if _, err := s.doHTTPS(ctx, b.Bytes()); err != nil {
-		// 即使服务端返回非 200，连接通常已经建立，这里仅记录日志
+	if _, err := s.doHTTPS(ctx, payload); err != nil {
 		errors.LogInfoInner(ctx, err, "DNS: warmup failed for ", s.Name())
 		return
 	}
@@ -170,7 +216,7 @@ func warmupMessage() dnsmessage.Message {
 }
 
 // resetTransport 替换连接池。旧连接池先关闭空闲连接，
-// 正在使用的连接在宽限期后再次尝试回收。
+// 正在使用的连接在宽限期后再次尝试回收，其余由 IdleConnTimeout 与 h2 PING 兜底。
 func (s *DoHNameServer) resetTransport() {
 	old := s.conn.Swap(s.newConn())
 	if old != nil {
@@ -179,26 +225,25 @@ func (s *DoHNameServer) resetTransport() {
 	}
 }
 
-// newConn 创建新的 HTTP/2 客户端。
+// newConn 创建新的 HTTP/2 连接池。
 func (s *DoHNameServer) newConn() *dohConn {
-	t := &http2.Transport{
-		IdleConnTimeout: net.ConnIdleTimeout,
-		ReadIdleTimeout: net.ChromeH2KeepAlivePeriod,
-		PingTimeout:     15 * time.Second,
-		DialTLSContext:  s.dialTLS,
-	}
 	return &dohConn{
-		client:    &http.Client{Transport: t},
-		transport: t,
+		transport: &http2.Transport{
+			IdleConnTimeout: net.ConnIdleTimeout,
+			ReadIdleTimeout: net.ChromeH2KeepAlivePeriod,
+			PingTimeout:     15 * time.Second,
+			DialTLSContext:  s.dialTLS,
+		},
 	}
 }
 
 // dialTLS 是 http2.Transport 使用的拨号函数。
 // TLS 完全由 uTLS 管理，因此忽略 http2 传入的 *tls.Config。
+// 所有错误都带上 dohDialError 标记，便于调用方判断是否值得重试。
 func (s *DoHNameServer) dialTLS(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 	dest, err := net.ParseDestination(network + ":" + addr)
 	if err != nil {
-		return nil, err
+		return nil, &dohDialError{err}
 	}
 
 	var conn net.Conn
@@ -214,13 +259,17 @@ func (s *DoHNameServer) dialTLS(ctx context.Context, network, addr string, _ *tl
 		conn, err = internet.DialSystem(ctx, dest, nil)
 	}
 	if err != nil {
-		return nil, err
+		return nil, &dohDialError{err}
 	}
 
 	if s.h2c {
 		return conn, nil
 	}
-	return s.handshakeTLS(ctx, conn)
+	tlsConn, err := s.handshakeTLS(ctx, conn)
+	if err != nil {
+		return nil, &dohDialError{err}
+	}
+	return tlsConn, nil
 }
 
 // dialViaDispatcher 通过 Xray 路由链路建立连接。
@@ -292,9 +341,12 @@ func (s *DoHNameServer) getCacheController() *CacheController {
 	return s.cacheController
 }
 
-// Close 停止后台任务并关闭空闲连接。
+// Close 停止后台任务、取消订阅并关闭空闲连接。可重复调用。
 func (s *DoHNameServer) Close() error {
-	s.closeOnce.Do(s.cancel)
+	s.closeOnce.Do(func() {
+		s.cancel()
+		sharedNetWatcher.unsubscribe(s)
+	})
 	if c := s.conn.Load(); c != nil {
 		c.transport.CloseIdleConnections()
 	}
@@ -305,11 +357,20 @@ func (s *DoHNameServer) Close() error {
 func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns_feature.IPOption) {
 	errors.LogInfo(ctx, s.Name(), " querying: ", fqdn)
 
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(dohDefaultTimeout)
+	}
+	// 错误上报用带 deadline 的 ctx，保证即使调用方 ctx 没有 deadline，
+	// 在消费方退出后 goroutine 也一定会结束
+	reportCtx, cancelReport := context.WithDeadline(ctx, deadline)
+	defer cancelReport()
+
 	if s.isSelfQuery(fqdn) {
 		errors.LogError(ctx, s.Name(), " tries to resolve itself! Use IP or set \"hosts\" instead")
-		err := errors.New("tries to resolve itself!", s.Name())
+		err := errors.New("tries to resolve itself! ", s.Name())
 		for i := 0; i < enabledFamilies(option); i++ {
-			sendErr(ctx, noResponseErrCh, err)
+			sendErr(reportCtx, noResponseErrCh, err)
 		}
 		return
 	}
@@ -319,14 +380,9 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	if err != nil {
 		errors.LogErrorInner(ctx, err, "failed to build dns query for ", fqdn)
 		for i := 0; i < enabledFamilies(option); i++ {
-			sendErr(ctx, noResponseErrCh, err)
+			sendErr(reportCtx, noResponseErrCh, err)
 		}
 		return
-	}
-
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(dohDefaultTimeout)
 	}
 
 	for _, req := range reqs {
@@ -334,13 +390,9 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 }
 
-// reqContext 为请求附加 Inbound 与 Content 信息。查询与预热共用。
+// reqContext 为请求附加 Content 信息（inbound 已包含在 parent 中）。查询与预热共用。
 func (s *DoHNameServer) reqContext(parent context.Context) context.Context {
-	ctx := parent
-	if inbound := session.InboundFromContext(parent); inbound != nil {
-		ctx = session.ContextWithInbound(ctx, inbound)
-	}
-	return session.ContextWithContent(ctx, &session.Content{
+	return session.ContextWithContent(parent, &session.Content{
 		Protocol:       "https",
 		SkipDNSResolve: true,
 	})
@@ -351,31 +403,45 @@ func (s *DoHNameServer) resolveOne(parent context.Context, deadline time.Time, e
 	dnsCtx, cancel := context.WithDeadline(s.reqContext(parent), deadline)
 	defer cancel()
 
+	// 并发上限：等待受 deadline 约束，不会无限排队
+	select {
+	case s.inflight <- struct{}{}:
+		defer func() { <-s.inflight }()
+	case <-dnsCtx.Done():
+		err := errors.New("too many concurrent DoH queries on ", s.Name()).Base(dnsCtx.Err())
+		errors.LogInfoInner(parent, err, "dropped query for ", fqdn)
+		sendErr(dnsCtx, errCh, err)
+		return
+	}
+
 	b, err := dns.PackMessage(r.msg)
 	if err != nil {
 		errors.LogErrorInner(parent, err, "failed to pack dns query for ", fqdn)
-		sendErr(parent, errCh, err)
+		sendErr(dnsCtx, errCh, err)
 		return
 	}
-	defer b.Release()
+	// 请求体必须使用独立副本：出错或取消后 RoundTrip 可能先于 h2 写 goroutine 返回，
+	// 若仍引用池化缓冲区，归还后会产生数据竞争
+	payload := bytes.Clone(b.Bytes())
+	b.Release()
 
-	body, err := s.doHTTPS(dnsCtx, b.Bytes())
+	body, err := s.doHTTPS(dnsCtx, payload)
 	if err != nil {
 		errors.LogErrorInner(parent, err, "failed to retrieve response for ", fqdn)
-		sendErr(parent, errCh, err)
+		sendErr(dnsCtx, errCh, err)
 		return
 	}
 
 	rec, err := parseResponse(body)
 	if err != nil {
 		errors.LogErrorInner(parent, err, "failed to handle DOH response for ", fqdn)
-		sendErr(parent, errCh, err)
+		sendErr(dnsCtx, errCh, err)
 		return
 	}
 	s.cacheController.updateRecord(r, rec)
 }
 
-// doHTTPS 对传输层错误做有限次重试（例如复用的连接已被服务端关闭）。
+// doHTTPS 对可恢复的传输层错误做有限次重试（例如复用的连接已被服务端关闭）。
 func (s *DoHNameServer) doHTTPS(ctx context.Context, payload []byte) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt < dohMaxAttempts; attempt++ {
@@ -391,6 +457,18 @@ func (s *DoHNameServer) doHTTPS(ctx context.Context, payload []byte) ([]byte, er
 	return nil, lastErr
 }
 
+// dohRetryable 判断 RoundTrip 错误是否值得立刻重试。
+func dohRetryable(err error) bool {
+	var dialErr *dohDialError
+	if stderrors.As(err, &dialErr) {
+		// 拨号/握手/ALPN 失败：立刻重试没有意义。
+		// 例外：h2 连接池的拨号可能被多个请求共享，别的请求取消会连带本请求失败，
+		// 此时本请求自己的 ctx 仍然有效（doHTTPS 会检查 ctx.Err()），重试是合理的。
+		return stderrors.Is(err, context.Canceled)
+	}
+	return true
+}
+
 // doOnce 执行一次 DoH 请求。第二个返回值表示该错误是否可重试。
 func (s *DoHNameServer) doOnce(ctx context.Context, payload []byte) ([]byte, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.dohURL, bytes.NewReader(payload))
@@ -403,9 +481,11 @@ func (s *DoHNameServer) doOnce(ctx context.Context, payload []byte) ([]byte, boo
 	utils.TryDefaultHeadersWith(req.Header, "fetch")
 	req.Header.Set("X-Padding", utils.H2Base62Pad(crypto.RandBetween(100, 1000)))
 
-	resp, err := s.conn.Load().client.Do(req)
+	// 直接使用 RoundTrip：不需要 http.Client 的重定向跟随，
+	// 否则重定向目标会再走一遍 dispatcher 拨号
+	resp, err := s.conn.Load().transport.RoundTrip(req)
 	if err != nil {
-		return nil, true, err
+		return nil, dohRetryable(err), err
 	}
 	defer resp.Body.Close()
 
@@ -414,18 +494,42 @@ func (s *DoHNameServer) doOnce(ctx context.Context, payload []byte) ([]byte, boo
 		return nil, false, errors.New("DoH server returned code ", resp.StatusCode)
 	}
 
-	if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, dohMediaType) {
-		return nil, false, errors.New("unexpected content-type from DoH server: ", ct)
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		if mediaType, _, err := mime.ParseMediaType(ct); err != nil || mediaType != dohMediaType {
+			return nil, false, errors.New("unexpected content-type from DoH server: ", ct)
+		}
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, dohMaxResponseSize+1))
+	body, err := readDoHBody(resp)
 	if err != nil {
-		return nil, true, err
-	}
-	if len(body) > dohMaxResponseSize {
-		return nil, false, errors.New("DoH response exceeds maximum DNS message size")
+		return nil, stderrors.Is(err, errDoHTooLarge) == false, err
 	}
 	return body, false, nil
+}
+
+var errDoHTooLarge = stderrors.New("DoH response exceeds maximum DNS message size")
+
+// readDoHBody 读取响应体：长度已知时精确分配，未知时用带上限的 ReadAll。
+func readDoHBody(resp *http.Response) ([]byte, error) {
+	if resp.ContentLength > dohMaxResponseSize {
+		return nil, errDoHTooLarge
+	}
+	if n := resp.ContentLength; n > 0 {
+		body := make([]byte, n)
+		if _, err := io.ReadFull(resp.Body, body); err != nil {
+			return nil, err
+		}
+		return body, nil
+	}
+	// 未知长度（例如响应被透明解压）：多读 1 字节用于检测超限
+	body, err := io.ReadAll(io.LimitReader(resp.Body, dohMaxResponseSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > dohMaxResponseSize {
+		return nil, errDoHTooLarge
+	}
+	return body, nil
 }
 
 // isSelfQuery 检测是否在解析 DoH 服务器自身的域名（会导致循环依赖）。
@@ -438,41 +542,114 @@ func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, option dns_f
 	return queryIP(ctx, s, domain, option)
 }
 
-// watchNetwork 定时检查本机接口地址签名，变化时回调。
-// 在 Android 等平台上可能无法枚举接口，此时应由平台层调用 OnNetworkChanged。
-func watchNetwork(ctx context.Context, period time.Duration, onChange func()) {
-	last, _ := interfaceSignature()
-	ticker := time.NewTicker(period)
+// ---------------------------------------------------------------------------
+// 全局唯一的网络变化监听
+// ---------------------------------------------------------------------------
+
+// netWatcher 用一个 goroutine 服务所有 DoH 实例。
+// 订阅者以弱引用保存：实例被丢弃（即使没有 Close）后会在下一轮自动剔除，
+// 订阅表为空时 goroutine 自行退出，不留后台任务。
+type netWatcher struct {
+	mu      sync.Mutex
+	subs    map[weak.Pointer[DoHNameServer]]struct{}
+	running bool
+}
+
+var sharedNetWatcher = &netWatcher{subs: make(map[weak.Pointer[DoHNameServer]]struct{})}
+
+func (w *netWatcher) subscribe(s *DoHNameServer) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.subs[weak.Make(s)] = struct{}{}
+	if !w.running {
+		w.running = true
+		go w.loop()
+	}
+}
+
+func (w *netWatcher) unsubscribe(s *DoHNameServer) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.subs, weak.Make(s))
+}
+
+// snapshot 返回仍然存活的订阅者；没有订阅者时把 running 置 false 并通知 loop 退出。
+// 判断与置位在同一把锁内完成，与 subscribe 不会产生"漏启动"的竞态。
+func (w *netWatcher) snapshot() ([]*DoHNameServer, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	live := make([]*DoHNameServer, 0, len(w.subs))
+	for wp := range w.subs {
+		if s := wp.Value(); s != nil {
+			live = append(live, s)
+		} else {
+			delete(w.subs, wp)
+		}
+	}
+	if len(live) == 0 {
+		w.running = false
+		return nil, false
+	}
+	return live, true
+}
+
+func (w *netWatcher) loop() {
+	last, haveLast := interfaceSignature()
+	ticker := time.NewTicker(dohNetworkPollPeriod)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
+	for range ticker.C {
+		servers, ok := w.snapshot()
+		if !ok {
 			return
-		case <-ticker.C:
-			cur, err := interfaceSignature()
-			if err != nil || cur == last {
-				continue
-			}
-			last = cur
-			onChange()
+		}
+		cur, ok := interfaceSignature()
+		if !ok {
+			continue // 部分平台无法枚举接口，应由平台层调用 OnNetworkChanged
+		}
+		if !haveLast {
+			last, haveLast = cur, true // 初始读取失败：只记录基线，不触发回调
+			continue
+		}
+		if cur == last {
+			continue
+		}
+		last = cur
+		for _, s := range servers {
+			s.OnNetworkChanged()
 		}
 	}
 }
 
-// interfaceSignature 返回所有接口地址的稳定字符串表示。
-func interfaceSignature() (string, error) {
+// interfaceSignature 返回所有"有意义"的接口地址的哈希。
+// 忽略回环与链路本地地址，减少虚拟网卡带来的误报。
+func interfaceSignature() (uint64, bool) {
 	addrs, err := stdnet.InterfaceAddrs()
 	if err != nil {
-		return "", err
+		return 0, false
 	}
 	parts := make([]string, 0, len(addrs))
 	for _, a := range addrs {
+		if ipNet, ok := a.(*stdnet.IPNet); ok {
+			ip := ipNet.IP
+			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				continue
+			}
+		}
 		parts = append(parts, a.String())
 	}
 	sort.Strings(parts)
-	return strings.Join(parts, "|"), nil
+	h := fnv.New64a()
+	for _, p := range parts {
+		_, _ = h.Write([]byte(p))
+		_, _ = h.Write([]byte{0})
+	}
+	return h.Sum64(), true
 }
+
+// ---------------------------------------------------------------------------
+// 包内共享的小工具
+// ---------------------------------------------------------------------------
 
 // enabledFamilies 返回启用的地址族数量（IPv4 / IPv6）。
 func enabledFamilies(option dns_feature.IPOption) int {
@@ -486,10 +663,17 @@ func enabledFamilies(option dns_feature.IPOption) int {
 	return n
 }
 
-// sendErr 非阻塞地发送错误：调用方不再接收时直接放弃，避免协程泄漏。
+// sendErr 发送错误：先非阻塞尝试（通道有缓冲时立即成功，且不受 ctx 已结束的影响），
+// 否则阻塞到发送成功或 ctx 结束。调用方必须传入带 deadline 或会被取消的 ctx，
+// 否则消费方退出后 goroutine 会永久阻塞。
 func sendErr(ctx context.Context, ch chan<- error, err error) {
 	if ch == nil {
 		return
+	}
+	select {
+	case ch <- err:
+		return
+	default:
 	}
 	select {
 	case ch <- err:
