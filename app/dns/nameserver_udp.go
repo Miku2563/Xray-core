@@ -2,8 +2,6 @@ package dns
 
 import (
 	"context"
-	"encoding/binary"
-	"io"
 	"strings"
 	"sync"
 	"time"
@@ -12,24 +10,23 @@ import (
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/protocol/dns"
 	udp_proto "github.com/xtls/xray-core/common/protocol/udp"
-	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/session"
 	dns_feature "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/udp"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
 const (
-	classicDefaultPort    = 53
-	classicEDNSUDPSize    = 1232            // DNS Flag Day 2020 推荐值
-	classicPendingTTL     = 8 * time.Second // pending 请求的最长存活时间
-	classicCleanupPeriod  = 5 * time.Second // 过期清理周期
-	classicDefaultTimeout = 5 * time.Second // 无 deadline 时 TCP 回退的超时
-	classicMaxPending     = 1 << 16         // 同一服务器上最多同时挂起的请求数（受 ID 空间限制）
+	classicDefaultPort   = 53
+	classicEDNSUDPSize   = 1232            // DNS Flag Day 2020 推荐值
+	classicPendingTTL    = 8 * time.Second // pending 请求的最长存活时间
+	classicCleanupPeriod = 5 * time.Second // 过期清理周期（仅在有 pending 时运行）
+	// 同一服务器上最多同时挂起的请求数。
+	// 刻意低于 ID 空间（65536）的一半，保证随机探测空闲 ID 的期望次数不超过 2 次。
+	classicMaxPending = 1 << 15
 )
 
 // classicStrictSource 为 true 时校验响应来源的地址与端口。
@@ -37,6 +34,10 @@ const (
 var classicStrictSource = true
 
 // ClassicNameServer implemented traditional UDP DNS.
+// 收到 TC（截断）响应时：先尝试带 EDNS0 的 UDP 重试，仍被截断（或无法重试）则回退 TCP。
+//
+// 资源模型：没有常驻 goroutine。清理定时器只在 pending 表非空时存在，表空即停止，
+// 因此即使配置重载后旧实例没有被 Close，也不会留下后台任务。
 type ClassicNameServer struct {
 	mu              sync.RWMutex
 	cacheController *CacheController
@@ -44,14 +45,19 @@ type ClassicNameServer struct {
 	dispatcher      routing.Dispatcher
 	requests        map[uint16]*udpDnsRequest
 	udpServer       *udp.Dispatcher
-	requestsCleanup *task.Periodic
+	tcpFallback     *tcpExchanger // 与 UDP 同一目标地址的 TCP 查询能力（自带并发上限）
 	clientIP        net.IP
-	closeOnce       sync.Once
+
+	// 以下字段受 mu 保护
+	cleanupTimer     *time.Timer
+	cleanupScheduled bool
+	closed           bool
 }
 
 type udpDnsRequest struct {
 	dnsRequest
-	ctx context.Context
+	ctx   context.Context
+	errCh chan<- error // 回退失败时用于快速通知 queryIP，可为 nil
 }
 
 // NewClassicNameServer creates udp server object for remote resolving.
@@ -61,20 +67,23 @@ func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher
 		address.Port = net.Port(classicDefaultPort)
 	}
 
+	tcpDest := net.TCPDestination(address.Address, address.Port)
+	var dial func(context.Context) (net.Conn, error)
+	if dispatcher == nil {
+		dial = localDial(tcpDest)
+	} else {
+		dial = dispatcherDial(dispatcher, tcpDest)
+	}
+
 	s := &ClassicNameServer{
 		cacheController: NewCacheController(strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
 		address:         &address,
 		dispatcher:      dispatcher,
 		requests:        make(map[uint16]*udpDnsRequest),
+		tcpFallback:     newTCPExchanger(tcpDest, dial),
 		clientIP:        clientIP,
 	}
-	s.requestsCleanup = &task.Periodic{
-		Interval: classicCleanupPeriod,
-		Execute:  s.RequestsCleanup,
-	}
 	s.udpServer = udp.NewDispatcher(dispatcher, s.HandleResponse)
-
-	common.Must(s.requestsCleanup.Start())
 
 	errors.LogInfo(context.Background(), "DNS: created UDP client initialized for ", address.NetAddr())
 	return s
@@ -90,24 +99,34 @@ func (s *ClassicNameServer) IsDisableCache() bool {
 	return s.cacheController.disableCache
 }
 
-// Close 停止清理任务并释放 pending 表。配置重载或销毁客户端时调用。
+// Close 停止清理定时器并释放 pending 表。关闭后不再接受新的 pending 请求。
+// 即使不调用 Close，空闲实例也不持有任何后台任务。
 func (s *ClassicNameServer) Close() error {
-	s.closeOnce.Do(func() {
-		_ = s.requestsCleanup.Close()
-		s.mu.Lock()
-		s.requests = make(map[uint16]*udpDnsRequest)
-		s.mu.Unlock()
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	if s.cleanupTimer != nil {
+		s.cleanupTimer.Stop()
+		s.cleanupTimer = nil
+	}
+	s.cleanupScheduled = false
+	s.requests = make(map[uint16]*udpDnsRequest)
 	return nil
 }
 
-// RequestsCleanup 清理已过期的 pending 请求。
-// 返回值恒为 nil，清理任务随服务器生命周期运行，由 Close 停止。
+// RequestsCleanup 立即清理已过期的 pending 请求（保留导出方法以兼容外部调用）。
 func (s *ClassicNameServer) RequestsCleanup() error {
-	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sweepLocked(time.Now())
+	return nil
+}
 
+// sweepLocked 删除过期条目；表被清空时重建 map 以释放内存（Go 的 map 不会自动收缩）。
+func (s *ClassicNameServer) sweepLocked(now time.Time) {
 	removed := 0
 	for id, req := range s.requests {
 		if now.After(req.expire) {
@@ -115,11 +134,35 @@ func (s *ClassicNameServer) RequestsCleanup() error {
 			removed++
 		}
 	}
-	// Go 的 map 不会自动收缩，表空时重建以释放内存
 	if removed > 0 && len(s.requests) == 0 {
 		s.requests = make(map[uint16]*udpDnsRequest)
 	}
-	return nil
+}
+
+// scheduleCleanupLocked 在表由空变非空时启动清理定时器。必须持有 mu。
+func (s *ClassicNameServer) scheduleCleanupLocked() {
+	if s.cleanupScheduled || s.closed {
+		return
+	}
+	s.cleanupScheduled = true
+	s.cleanupTimer = time.AfterFunc(classicCleanupPeriod, s.cleanupTick)
+}
+
+// cleanupTick 清理一轮；表仍非空则继续排下一轮，否则停止，不留后台任务。
+func (s *ClassicNameServer) cleanupTick() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		s.cleanupScheduled = false
+		return
+	}
+	s.sweepLocked(time.Now())
+	if len(s.requests) == 0 {
+		s.cleanupScheduled = false
+		s.cleanupTimer = nil
+		return
+	}
+	s.cleanupTimer.Reset(classicCleanupPeriod)
 }
 
 // HandleResponse handles udp response packet from remote DNS server.
@@ -148,6 +191,16 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 		return
 	}
 
+	// 必须在 parseResponse 之前处理 TC：被截断的报文可能在记录中间被切断，
+	// 解析会失败，若先解析，回退就永远不会触发。
+	// 截断响应里的任何记录都不可信，直接丢弃，不解析、不缓存。
+	if hdr.Truncated {
+		if s.removePending(req) { // 只有第一个到达的 TC 包触发回退
+			s.handleTruncated(req)
+		}
+		return
+	}
+
 	ipRec, err := parseResponse(raw)
 	if err != nil {
 		errors.LogInfoInner(ctx, err, s.Name(), " failed to parse response")
@@ -158,150 +211,87 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 	if !s.removePending(req) {
 		return
 	}
-
-	if hdr.Truncated {
-		s.handleTruncated(req)
-		return
-	}
 	s.cacheController.updateRecord(&req.dnsRequest, ipRec)
 }
 
-// handleTruncated 处理 TC 位：未使用 EDNS0 时升级后重发 UDP，否则回退 TCP。
+// handleTruncated 处理 TC 位。调用时 req 已从 pending 表移除。
+//
+//   - 原查询没有足够大的 EDNS0：换新 ID，带 EDNS0 重发 UDP（最多一次）。
+//   - 已经使用了足够大的 EDNS0 仍被截断，或 UDP 重试无法进行：回退 TCP。
+//     TCP 不占用 pending 表，并发由 tcpExchanger 的信号量限制。
 func (s *ClassicNameServer) handleTruncated(req *udpDnsRequest) {
 	msg, ok := withEDNS0Size(req.msg, classicEDNSUDPSize)
 	if !ok {
-		// 已经使用了足够大的 EDNS0 仍被截断，UDP 无法获得完整结果
 		go s.queryTCP(req)
 		return
 	}
 
-	retry := &udpDnsRequest{dnsRequest: req.dnsRequest, ctx: req.ctx}
+	retry := &udpDnsRequest{dnsRequest: req.dnsRequest, ctx: req.ctx, errCh: req.errCh}
 	retry.msg = msg
-	if !s.addPending(retry) {
-		errors.LogInfo(req.ctx, s.Name(), " pending table full, skip EDNS0 retry")
+	// 换新 ID，避免上一轮晚到的包串入这一轮；addPendingUntil 仍会处理冲突
+	retry.msg.ID = s.newReqID()
+
+	// 以原请求的过期时间封顶，重试不会把总时长翻倍
+	if !s.addPendingUntil(retry, req.expire) {
+		errors.LogInfo(req.ctx, s.Name(), " cannot register EDNS0 retry, falling back to TCP")
+		go s.queryTCP(req)
 		return
 	}
 
 	b, err := dns.PackMessage(retry.msg)
 	if err != nil {
 		s.removePending(retry)
-		errors.LogErrorInner(req.ctx, err, s.Name(), " failed to pack EDNS0 retry")
+		errors.LogInfoInner(req.ctx, err, s.Name(), " failed to pack EDNS0 retry, falling back to TCP")
+		go s.queryTCP(req)
 		return
 	}
 	s.udpServer.Dispatch(toDnsContext(req.ctx, s.address.String()), *s.address, b)
 }
 
-// queryTCP 在 TCP 上重新查询（DNS over TCP，RFC 7766，报文前有 2 字节长度前缀）。
+// queryTCP 在 TCP 上重新查询（RFC 7766），结果写回本服务器自己的缓存。
+// 连接、ctx、信号量的释放都在 tcpExchanger.exchange 内部完成。
 func (s *ClassicNameServer) queryTCP(req *udpDnsRequest) {
-	deadline, ok := req.ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(classicDefaultTimeout)
-	}
-	ctx, cancel := context.WithDeadline(req.ctx, deadline)
-	defer cancel()
+	ctx := session.ContextWithContent(req.ctx, &session.Content{
+		Protocol:       "dns",
+		SkipDNSResolve: true,
+	})
 
-	b, err := dns.PackMessage(req.msg)
+	payload, err := s.tcpFallback.exchange(ctx, req.msg)
 	if err != nil {
-		errors.LogErrorInner(ctx, err, s.Name(), " failed to pack TCP query")
+		errors.LogInfoInner(req.ctx, err, s.Name(), " TCP fallback failed")
+		reportErr(req.errCh, err) // 快速失败，不让 queryIP 空等到超时
 		return
 	}
-	defer b.Release()
-	payload := b.Bytes()
 
-	conn, err := s.dialTCP(ctx)
+	ipRec, err := parseResponse(payload)
 	if err != nil {
-		errors.LogInfoInner(ctx, err, s.Name(), " TCP fallback dial failed")
-		return
-	}
-	defer conn.Close()
-
-	if err := conn.SetDeadline(deadline); err != nil {
-		errors.LogInfoInner(ctx, err, s.Name(), " failed to set TCP deadline")
-		return
-	}
-
-	frame := make([]byte, 2+len(payload))
-	binary.BigEndian.PutUint16(frame, uint16(len(payload)))
-	copy(frame[2:], payload)
-	if _, err := conn.Write(frame); err != nil {
-		errors.LogInfoInner(ctx, err, s.Name(), " TCP write failed")
-		return
-	}
-
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-		errors.LogInfoInner(ctx, err, s.Name(), " TCP read length failed")
-		return
-	}
-	body := make([]byte, binary.BigEndian.Uint16(lenBuf[:]))
-	if _, err := io.ReadFull(conn, body); err != nil {
-		errors.LogInfoInner(ctx, err, s.Name(), " TCP read body failed")
-		return
-	}
-
-	hdr, q, err := parseHeaderAndQuestion(body)
-	if err != nil || !hdr.Response || hdr.ID != req.msg.ID || !questionMatches(req.msg, q) {
-		errors.LogInfo(ctx, s.Name(), " TCP response does not match the query")
-		return
-	}
-
-	ipRec, err := parseResponse(body)
-	if err != nil {
-		errors.LogInfoInner(ctx, err, s.Name(), " failed to parse TCP response")
+		errors.LogInfoInner(req.ctx, err, s.Name(), " failed to parse TCP response")
+		reportErr(req.errCh, err)
 		return
 	}
 	s.cacheController.updateRecord(&req.dnsRequest, ipRec)
 }
 
-// dialTCP 通过 Xray 路由链路（或系统拨号）建立到服务器的 TCP 连接。
-func (s *ClassicNameServer) dialTCP(ctx context.Context) (net.Conn, error) {
-	dest := net.Destination{
-		Network: net.Network_TCP,
-		Address: s.address.Address,
-		Port:    s.address.Port,
-	}
-	if s.dispatcher == nil {
-		return internet.DialSystem(ctx, dest, nil)
-	}
-
-	link, err := s.dispatcher.Dispatch(toDnsContext(ctx, s.address.String()), dest)
-	if err != nil {
-		return nil, err
-	}
-	// 拨号返回后若 ctx 已结束，主动关闭链路，避免泄漏
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		closeIfPossible(link.Writer)
-		closeIfPossible(link.Reader)
-		return nil, ctxErr
-	}
-
-	cc := common.ChainedClosable{}
-	if cw, ok := link.Writer.(common.Closable); ok {
-		cc = append(cc, cw)
-	}
-	if cr, ok := link.Reader.(common.Closable); ok {
-		cc = append(cc, cr)
-	}
-	return cnc.NewConnection(
-		cnc.ConnectionInputMulti(link.Writer),
-		cnc.ConnectionOutputMulti(link.Reader),
-		cnc.ConnectionOnClose(cc),
-	), nil
-}
-
 // newReqID 生成随机 ID，替代可预测的顺序计数器。
-// 冲突由 addPending 处理。
+// 冲突由 addPendingUntil 处理。
 func (s *ClassicNameServer) newReqID() uint16 {
 	return uint16(crypto.RandBetween(0, 0xFFFF))
 }
 
-// addPending 登记一个待响应的请求，并分配一个当前未被占用的 ID。
-// 会修改 req.msg.ID，因此必须在打包报文之前调用。
+// addPending 登记一个待响应的请求。
 func (s *ClassicNameServer) addPending(req *udpDnsRequest) bool {
+	return s.addPendingUntil(req, time.Time{})
+}
+
+// addPendingUntil 登记一个待响应的请求，并分配一个当前未被占用的 ID。
+// limit 非零时，过期时间不会晚于 limit。
+// 会修改 req.msg.ID，因此必须在打包报文之前调用。
+// 返回 false 表示表已满或服务器已关闭。
+func (s *ClassicNameServer) addPendingUntil(req *udpDnsRequest, limit time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.requests) >= classicMaxPending {
+	if s.closed || len(s.requests) >= classicMaxPending {
 		return false
 	}
 	for {
@@ -311,13 +301,17 @@ func (s *ClassicNameServer) addPending(req *udpDnsRequest) bool {
 		req.msg.ID = s.newReqID()
 	}
 
-	// 过期时间取 TTL 与 query deadline 中较早者
+	// 过期时间取 TTL、query deadline、limit 中最早者
 	exp := time.Now().Add(classicPendingTTL)
 	if d, ok := req.ctx.Deadline(); ok && d.Before(exp) {
 		exp = d
 	}
+	if !limit.IsZero() && limit.Before(exp) {
+		exp = limit
+	}
 	req.expire = exp
 	s.requests[req.msg.ID] = req
+	s.scheduleCleanupLocked()
 	return true
 }
 
@@ -374,8 +368,12 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 	reqs, err := buildReqMsgs(fqdn, option, s.newReqID, genEDNS0Options(s.clientIP, 0))
 	if err != nil {
 		errors.LogErrorInner(ctx, err, "failed to build dns query for ", fqdn)
-		for i := 0; i < enabledFamilies(option); i++ {
-			sendErr(ctx, noResponseErrCh, err)
+		// 每个启用的地址族各上报一次
+		if option.IPv4Enable {
+			reportErr(noResponseErrCh, err)
+		}
+		if option.IPv6Enable {
+			reportErr(noResponseErrCh, err)
 		}
 		return
 	}
@@ -387,11 +385,11 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 
 // sendOne 发送单个请求（A 或 AAAA）。失败时只影响该请求，不中断其他请求。
 func (s *ClassicNameServer) sendOne(ctx context.Context, errCh chan<- error, fqdn string, r *dnsRequest) {
-	req := &udpDnsRequest{dnsRequest: *r, ctx: ctx}
+	req := &udpDnsRequest{dnsRequest: *r, ctx: ctx, errCh: errCh}
 
 	if !s.addPending(req) {
-		errors.LogInfo(ctx, s.Name(), " pending table full, drop query for ", fqdn)
-		sendErr(ctx, errCh, errors.New("too many pending DNS requests"))
+		errors.LogInfo(ctx, s.Name(), " pending table full or server closed, drop query for ", fqdn)
+		reportErr(errCh, errors.New("too many pending DNS requests"))
 		return
 	}
 
@@ -399,7 +397,7 @@ func (s *ClassicNameServer) sendOne(ctx context.Context, errCh chan<- error, fqd
 	if err != nil {
 		s.removePending(req)
 		errors.LogErrorInner(ctx, err, "failed to pack dns query for ", fqdn)
-		sendErr(ctx, errCh, err)
+		reportErr(errCh, err)
 		return
 	}
 	s.udpServer.Dispatch(toDnsContext(ctx, s.address.String()), *s.address, b)
