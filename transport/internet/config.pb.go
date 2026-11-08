@@ -979,7 +979,7 @@ const file_transport_internet_config_proto_rawDesc = "" +
 	"\fdialer_proxy\x18\t \x01(\tR\vdialerProxy\x125\n" +
 	"\x17tcp_keep_alive_interval\x18\n" +
 	" \x01(\x05R\x14tcpKeepAliveInterval\x12-\n" +
-	"\x13tcp_keep_alive_idle\x18\v \x01(\x05R\x10tcpKeepAliveIdle\x12%\n" +
+	"\x13tcp_keep_alive_idle\x18\v \x01(\x05R\x10tcpKeepAliveIdle\x12/\n" +
     "\x14tcp_keep_alive_count\x18) \x01(\x05R\x11tcpKeepAliveCount\x12%\n" +
 	"\x0etcp_congestion\x18\f \x01(\tR\rtcpCongestion\x12\x1c\n" +
 	"\tinterface\x18\r \x01(\tR\tinterface\x12\x16\n" +
