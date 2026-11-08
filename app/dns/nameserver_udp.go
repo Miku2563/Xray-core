@@ -1,12 +1,14 @@
 package dns
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -27,6 +29,16 @@ const (
 	// 同一服务器上最多同时挂起的请求数。
 	// 刻意低于 ID 空间（65536）的一半，保证随机探测空闲 ID 的期望次数不超过 2 次。
 	classicMaxPending = 1 << 15
+
+	// 重传：请求发出后若在 classicRetryDelay 内没有应答，用同一 ID 重发一次。
+	// 剩余时间不足时按剩余时间的一半计算；低于 classicMinRetryDelay 则不重传。
+	classicRetryDelay    = 1500 * time.Millisecond
+	classicMinRetryDelay = 300 * time.Millisecond
+)
+
+var (
+	errClassicClosed      = errors.New("DNS UDP server is closed")
+	errClassicPendingFull = errors.New("too many pending DNS requests")
 )
 
 // classicStrictSource 为 true 时校验响应来源的地址与端口。
@@ -35,8 +47,10 @@ var classicStrictSource = true
 
 // ClassicNameServer implemented traditional UDP DNS.
 // 收到 TC（截断）响应时：先尝试带 EDNS0 的 UDP 重试，仍被截断（或无法重试）则回退 TCP。
+// 请求发出后若迟迟没有应答，会用同一 ID 重传一次，以应对 UDP 丢包。
 //
-// 资源模型：没有常驻 goroutine。清理定时器只在 pending 表非空时存在，表空即停止，
+// 资源模型：没有常驻 goroutine。清理定时器只在 pending 表非空时存在，表空即停止；
+// 每个 pending 项最多持有一个一次性重传定时器，请求完成、被清扫或 Close 时都会停止。
 // 因此即使配置重载后旧实例没有被 Close，也不会留下后台任务。
 type ClassicNameServer struct {
 	mu              sync.RWMutex
@@ -58,6 +72,19 @@ type udpDnsRequest struct {
 	dnsRequest
 	ctx   context.Context
 	errCh chan<- error // 回退失败时用于快速通知 queryIP，可为 nil
+
+	// 以下字段受 ClassicNameServer.mu 保护
+	payload    []byte      // 已打包的查询报文副本，仅用于重传
+	retryTimer *time.Timer // 一次性重传定时器
+}
+
+// stopRetryLocked 停止重传定时器并释放报文副本。必须持有 mu。
+func (r *udpDnsRequest) stopRetryLocked() {
+	if r.retryTimer != nil {
+		r.retryTimer.Stop()
+		r.retryTimer = nil
+	}
+	r.payload = nil
 }
 
 // NewClassicNameServer creates udp server object for remote resolving.
@@ -99,12 +126,13 @@ func (s *ClassicNameServer) IsDisableCache() bool {
 	return s.cacheController.disableCache
 }
 
-// Close 停止清理定时器并释放 pending 表。关闭后不再接受新的 pending 请求。
+// Close 停止清理与重传定时器、释放 pending 表，并关闭 UDP 分发器和 TCP 回退通道。
+// 关闭后不再接受新的 pending 请求。可重复调用。
 // 即使不调用 Close，空闲实例也不持有任何后台任务。
 func (s *ClassicNameServer) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
@@ -113,7 +141,16 @@ func (s *ClassicNameServer) Close() error {
 		s.cleanupTimer = nil
 	}
 	s.cleanupScheduled = false
+	for _, req := range s.requests {
+		req.stopRetryLocked()
+	}
 	s.requests = make(map[uint16]*udpDnsRequest)
+	s.mu.Unlock()
+
+	// 在释放 mu 之后再关闭下层资源：它们关闭时可能回调 HandleResponse，
+	// 持锁关闭会有死锁风险。
+	closeIfPossible(s.udpServer)
+	closeIfPossible(s.tcpFallback)
 	return nil
 }
 
@@ -130,6 +167,7 @@ func (s *ClassicNameServer) sweepLocked(now time.Time) {
 	removed := 0
 	for id, req := range s.requests {
 		if now.After(req.expire) {
+			req.stopRetryLocked()
 			delete(s.requests, id)
 			removed++
 		}
@@ -185,6 +223,7 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 		return
 	}
 
+	// 重传后服务器可能对同一查询应答两次，第二个包会走到这里并被丢弃，属于正常现象
 	req := s.lookupPending(hdr.ID, q)
 	if req == nil {
 		errors.LogInfo(ctx, s.Name(), " no matching pending request for id ", hdr.ID)
@@ -232,20 +271,18 @@ func (s *ClassicNameServer) handleTruncated(req *udpDnsRequest) {
 	retry.msg.ID = s.newReqID()
 
 	// 以原请求的过期时间封顶，重试不会把总时长翻倍
-	if !s.addPendingUntil(retry, req.expire) {
-		errors.LogInfo(req.ctx, s.Name(), " cannot register EDNS0 retry, falling back to TCP")
+	if err := s.addPendingUntil(retry, req.expire); err != nil {
+		errors.LogInfoInner(req.ctx, err, s.Name(), " cannot register EDNS0 retry, falling back to TCP")
 		go s.queryTCP(req)
 		return
 	}
 
-	b, err := dns.PackMessage(retry.msg)
-	if err != nil {
+	if err := s.transmit(retry); err != nil {
 		s.removePending(retry)
 		errors.LogInfoInner(req.ctx, err, s.Name(), " failed to pack EDNS0 retry, falling back to TCP")
 		go s.queryTCP(req)
 		return
 	}
-	s.udpServer.Dispatch(toDnsContext(req.ctx, s.address.String()), *s.address, b)
 }
 
 // queryTCP 在 TCP 上重新查询（RFC 7766），结果写回本服务器自己的缓存。
@@ -279,20 +316,23 @@ func (s *ClassicNameServer) newReqID() uint16 {
 }
 
 // addPending 登记一个待响应的请求。
-func (s *ClassicNameServer) addPending(req *udpDnsRequest) bool {
+func (s *ClassicNameServer) addPending(req *udpDnsRequest) error {
 	return s.addPendingUntil(req, time.Time{})
 }
 
 // addPendingUntil 登记一个待响应的请求，并分配一个当前未被占用的 ID。
 // limit 非零时，过期时间不会晚于 limit。
 // 会修改 req.msg.ID，因此必须在打包报文之前调用。
-// 返回 false 表示表已满或服务器已关闭。
-func (s *ClassicNameServer) addPendingUntil(req *udpDnsRequest, limit time.Time) bool {
+// 返回 errClassicClosed 表示服务器已关闭，errClassicPendingFull 表示表已满。
+func (s *ClassicNameServer) addPendingUntil(req *udpDnsRequest, limit time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.closed || len(s.requests) >= classicMaxPending {
-		return false
+	if s.closed {
+		return errClassicClosed
+	}
+	if len(s.requests) >= classicMaxPending {
+		return errClassicPendingFull
 	}
 	for {
 		if _, used := s.requests[req.msg.ID]; !used {
@@ -312,10 +352,11 @@ func (s *ClassicNameServer) addPendingUntil(req *udpDnsRequest, limit time.Time)
 	req.expire = exp
 	s.requests[req.msg.ID] = req
 	s.scheduleCleanupLocked()
-	return true
+	return nil
 }
 
-// removePending 移除 pending 项，仅当 map 中仍是同一个请求时才删除。
+// removePending 移除 pending 项，仅当 map 中仍是同一个请求时才删除，
+// 同时停止它的重传定时器。
 // 返回 false 表示该请求已被其他路径处理。
 func (s *ClassicNameServer) removePending(req *udpDnsRequest) bool {
 	s.mu.Lock()
@@ -325,6 +366,7 @@ func (s *ClassicNameServer) removePending(req *udpDnsRequest) bool {
 	if !ok || cur != req {
 		return false
 	}
+	cur.stopRetryLocked()
 	delete(s.requests, req.msg.ID)
 	return true
 }
@@ -339,6 +381,57 @@ func (s *ClassicNameServer) lookupPending(id uint16, q dnsmessage.Question) *udp
 		return nil
 	}
 	return req
+}
+
+// transmit 打包并发送一个已登记的 pending 请求，同时武装一次性重传定时器。
+// 打包失败时返回错误，调用方负责 removePending。
+func (s *ClassicNameServer) transmit(req *udpDnsRequest) error {
+	b, err := dns.PackMessage(req.msg)
+	if err != nil {
+		return err
+	}
+	// 必须在 Dispatch 之前武装：Dispatch 会消费并释放 b；
+	// 武装时会确认请求仍在表中，避免给已完成的请求遗留定时器。
+	s.armRetransmit(req, b.Bytes())
+	s.udpServer.Dispatch(toDnsContext(req.ctx, s.address.String()), *s.address, b)
+	return nil
+}
+
+// armRetransmit 为 pending 请求设置一次性重传定时器。
+// packed 是刚打包的报文，只有真正武装时才复制一份。
+func (s *ClassicNameServer) armRetransmit(req *udpDnsRequest, packed []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed || s.requests[req.msg.ID] != req {
+		return // 应答已抢先到达，或服务器已关闭
+	}
+	delay := classicRetryDelay
+	if half := time.Until(req.expire) / 2; half < delay {
+		delay = half
+	}
+	if delay < classicMinRetryDelay {
+		return // 剩余时间太短，重传没有意义
+	}
+	req.payload = bytes.Clone(packed)
+	req.retryTimer = time.AfterFunc(delay, func() { s.retransmit(req) })
+}
+
+// retransmit 在重传定时器到期时执行：请求仍在等待则用同一 ID 重发原报文。
+// 只重传一次，之后若仍无应答则等待过期（或由 TC / 清扫路径处理）。
+func (s *ClassicNameServer) retransmit(req *udpDnsRequest) {
+	s.mu.Lock()
+	if s.closed || s.requests[req.msg.ID] != req || req.ctx.Err() != nil || req.payload == nil {
+		s.mu.Unlock()
+		return
+	}
+	payload := req.payload
+	req.payload = nil
+	req.retryTimer = nil
+	s.mu.Unlock()
+
+	errors.LogInfo(req.ctx, s.Name(), " no response for ", req.domain, " ", req.reqType, ", retransmitting")
+	s.udpServer.Dispatch(toDnsContext(req.ctx, s.address.String()), *s.address, buf.FromBytes(payload))
 }
 
 // isFromServer 校验响应来源是否为配置的服务器。
@@ -387,20 +480,18 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 func (s *ClassicNameServer) sendOne(ctx context.Context, errCh chan<- error, fqdn string, r *dnsRequest) {
 	req := &udpDnsRequest{dnsRequest: *r, ctx: ctx, errCh: errCh}
 
-	if !s.addPending(req) {
-		errors.LogInfo(ctx, s.Name(), " pending table full or server closed, drop query for ", fqdn)
-		reportErr(errCh, errors.New("too many pending DNS requests"))
+	if err := s.addPending(req); err != nil {
+		errors.LogInfoInner(ctx, err, s.Name(), " drop query for ", fqdn)
+		reportErr(errCh, err)
 		return
 	}
 
-	b, err := dns.PackMessage(req.msg)
-	if err != nil {
+	if err := s.transmit(req); err != nil {
 		s.removePending(req)
 		errors.LogErrorInner(ctx, err, "failed to pack dns query for ", fqdn)
 		reportErr(errCh, err)
 		return
 	}
-	s.udpServer.Dispatch(toDnsContext(ctx, s.address.String()), *s.address, b)
 }
 
 // QueryIP implements Server.
