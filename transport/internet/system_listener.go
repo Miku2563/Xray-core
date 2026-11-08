@@ -97,10 +97,10 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
 				return nil, errors.New("invalid TcpKeepAliveIdle or TcpKeepAliveInterval value: ", sockopt.TcpKeepAliveIdle, " ", sockopt.TcpKeepAliveInterval)
 			}
 			lc.KeepAliveConfig = net.KeepAliveConfig{
-				Enable:   false,
-				Idle:     -1,
-				Interval: -1,
-				Count:    -1,
+				Enable:   true,
+				Idle:     45,
+				Interval: 45,
+				Count:    3,
 			}
 			if sockopt.TcpKeepAliveIdle > 0 {
 				lc.KeepAliveConfig.Enable = true
@@ -110,6 +110,9 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
 				lc.KeepAliveConfig.Enable = true
 				lc.KeepAliveConfig.Interval = time.Duration(sockopt.TcpKeepAliveInterval) * time.Second
 			}
+			if sockopt.TcpKeepAliveCount > 0 {
+	keepAliveConfig.Count = int(sockopt.TcpKeepAliveCount)
+            } 
 			lc.SetMultipathTCP(sockopt.TcpMptcp)
 		}
 	case *net.UnixAddr:
