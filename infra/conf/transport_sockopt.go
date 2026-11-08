@@ -51,6 +51,7 @@ type SocketConfig struct {
 	DialerProxy           string                 `json:"dialerProxy"`
 	TCPKeepAliveInterval  int32                  `json:"tcpKeepAliveInterval"`
 	TCPKeepAliveIdle      int32                  `json:"tcpKeepAliveIdle"`
+	TCPKeepAliveCount     int32                  `json:"tcpKeepAliveCount"`
 	TCPCongestion         string                 `json:"tcpCongestion"`
 	TCPWindowClamp        int32                  `json:"tcpWindowClamp"`
 	TCPMaxSeg             int32                  `json:"tcpMaxSeg"`
