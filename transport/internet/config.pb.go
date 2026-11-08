@@ -647,6 +647,7 @@ type SocketConfig struct {
 	DialerProxy                string               `protobuf:"bytes,9,opt,name=dialer_proxy,json=dialerProxy,proto3" json:"dialer_proxy,omitempty"`
 	TcpKeepAliveInterval       int32                `protobuf:"varint,10,opt,name=tcp_keep_alive_interval,json=tcpKeepAliveInterval,proto3" json:"tcp_keep_alive_interval,omitempty"`
 	TcpKeepAliveIdle           int32                `protobuf:"varint,11,opt,name=tcp_keep_alive_idle,json=tcpKeepAliveIdle,proto3" json:"tcp_keep_alive_idle,omitempty"`
+	TcpKeepAliveCount          int32                `protobuf:"varint,41,opt,name=tcp_keep_alive_count,json=tcpKeepAliveCount,proto3" json:"tcp_keep_alive_count,omitempty"`
 	TcpCongestion              string               `protobuf:"bytes,12,opt,name=tcp_congestion,json=tcpCongestion,proto3" json:"tcp_congestion,omitempty"`
 	Interface                  string               `protobuf:"bytes,13,opt,name=interface,proto3" json:"interface,omitempty"`
 	V6Only                     bool                 `protobuf:"varint,14,opt,name=v6only,proto3" json:"v6only,omitempty"`
@@ -752,6 +753,13 @@ func (x *SocketConfig) GetTcpKeepAliveInterval() int32 {
 func (x *SocketConfig) GetTcpKeepAliveIdle() int32 {
 	if x != nil {
 		return x.TcpKeepAliveIdle
+	}
+	return 0
+}
+
+func (x *SocketConfig) GetTcpKeepAliveCount() int32 {
+	if x != nil {
+		return x.TcpKeepAliveCount
 	}
 	return 0
 }
@@ -960,7 +968,7 @@ const file_transport_internet_config_proto_rawDesc = "" +
 	"\x05level\x18\x03 \x01(\tR\x05level\x12\x10\n" +
 	"\x03opt\x18\x04 \x01(\tR\x03opt\x12\x14\n" +
 	"\x05value\x18\x05 \x01(\tR\x05value\x12\x12\n" +
-	"\x04type\x18\x06 \x01(\tR\x04type\"\xc9\b\n" +
+	"\x04type\x18\x06 \x01(\tR\x04type\"\xfa\b\n" +
 	"\fSocketConfig\x12\x12\n" +
 	"\x04mark\x18\x01 \x01(\x05R\x04mark\x12\x10\n" +
 	"\x03tfo\x18\x02 \x01(\x05R\x03tfo\x12H\n" +
@@ -972,6 +980,7 @@ const file_transport_internet_config_proto_rawDesc = "" +
 	"\x17tcp_keep_alive_interval\x18\n" +
 	" \x01(\x05R\x14tcpKeepAliveInterval\x12-\n" +
 	"\x13tcp_keep_alive_idle\x18\v \x01(\x05R\x10tcpKeepAliveIdle\x12%\n" +
+    "\x14tcp_keep_alive_count\x18) \x01(\x05R\x11tcpKeepAliveCount\x12%\n" +
 	"\x0etcp_congestion\x18\f \x01(\tR\rtcpCongestion\x12\x1c\n" +
 	"\tinterface\x18\r \x01(\tR\tinterface\x12\x16\n" +
 	"\x06v6only\x18\x0e \x01(\bR\x06v6only\x12(\n" +
