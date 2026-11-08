@@ -172,6 +172,7 @@ func (c *SocketConfig) Build() (*internet.SocketConfig, error) {
 		DialerProxy:          c.DialerProxy,
 		TcpKeepAliveInterval: c.TCPKeepAliveInterval,
 		TcpKeepAliveIdle:     c.TCPKeepAliveIdle,
+		TcpKeepAliveCount:    c.TCPKeepAliveCount,
 		TcpCongestion:        c.TCPCongestion,
 		TcpWindowClamp:       c.TCPWindowClamp,
 		TcpMaxSeg:            c.TCPMaxSeg,
