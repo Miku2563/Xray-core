@@ -117,7 +117,7 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		Enable:   true,
 		Idle:     45 * time.Second,
 		Interval: 45 * time.Second,
-		Count:    -1,
+		Count:    3,
 	}
 	keepAlive := time.Duration(0)
 	if sockopt != nil {
@@ -134,6 +134,9 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		if sockopt.TcpKeepAliveInterval > 0 {
 			keepAliveConfig.Interval = time.Duration(sockopt.TcpKeepAliveInterval) * time.Second
 		}
+		if sockopt.TcpKeepAliveCount > 0 {
+	keepAliveConfig.Count = int(sockopt.TcpKeepAliveCount)
+        }
 	}
 	dialer := &net.Dialer{
 		Timeout:         time.Second * 16,
