@@ -112,7 +112,7 @@ func (dl *DefaultListener) Listen(ctx context.Context, addr net.Addr, sockopt *S
 			}
 			if sockopt.TcpKeepAliveCount > 0 {
 				lc.KeepAliveConfig.Enable = true
-	            lc.keepAliveConfig.Count = int(sockopt.TcpKeepAliveCount)
+	            lc.KeepAliveConfig.Count = int(sockopt.TcpKeepAliveCount)
             } 
 			lc.SetMultipathTCP(sockopt.TcpMptcp)
 		}
