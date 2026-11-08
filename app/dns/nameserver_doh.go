@@ -502,7 +502,7 @@ func (s *DoHNameServer) doOnce(ctx context.Context, payload []byte) ([]byte, boo
 
 	body, err := readDoHBody(resp)
 	if err != nil {
-		return nil, stderrors.Is(err, errDoHTooLarge) == false, err
+		return nil, !stderrors.Is(err, errDoHTooLarge), err
 	}
 	return body, false, nil
 }
