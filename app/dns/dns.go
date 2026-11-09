@@ -204,6 +204,12 @@ func (s *DNS) Start() error {
 			return errors.New("failed to initialize DNS script").Base(err)
 		}
 	}
+	// script 启动成功之后再启动各 nameserver:
+	// 目前只有 DoH 实现了 Start(),用于后台预热连接并订阅网络变化。
+	// clients 在 New 之后不再变化,遍历无需加锁。
+	for _, c := range s.clients {
+		c.Start()
+	}
 	return nil
 }
 
@@ -212,7 +218,13 @@ func (s *DNS) Close() error {
 	if s.script != nil {
 		s.script.close()
 	}
-	return nil
+	var errs []error
+	for _, c := range s.clients {
+		if err := c.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Combine(errs...)
 }
 
 // IsOwnLink implements proxy.dns.ownLinkVerifier
@@ -542,34 +554,6 @@ func makeGroups( /*ctx context.Context,*/ clients []*Client) ([]group, []int) {
 		groupOf[k] = len(groups)
 	}
 	groups = append(groups, group{start: s, end: e})
-
-	// var b strings.Builder
-	// b.WriteString("dns grouping: total clients=")
-	// b.WriteString(strconv.Itoa(n))
-	// b.WriteString(", groups=")
-	// b.WriteString(strconv.Itoa(len(groups)))
-
-	// for gi, g := range groups {
-	// 	b.WriteString("\n  [")
-	// 	b.WriteString(strconv.Itoa(g.start))
-	// 	b.WriteString("..")
-	// 	b.WriteString(strconv.Itoa(g.end))
-	// 	b.WriteString("] gid=")
-	// 	b.WriteString(strconv.Itoa(gi))
-	// 	b.WriteString(" pid=")
-	// 	b.WriteString(strconv.FormatUint(uint64(clients[g.start].policyID), 10))
-	// 	b.WriteString(" members: ")
-
-	// 	for i := g.start; i <= g.end; i++ {
-	// 		if i > g.start {
-	// 			b.WriteString(", ")
-	// 		}
-	// 		b.WriteString(strconv.Itoa(i))
-	// 		b.WriteByte(':')
-	// 		b.WriteString(clients[i].Name())
-	// 	}
-	// }
-	// errors.LogDebug(ctx, b.String())
 
 	return groups, groupOf
 }
