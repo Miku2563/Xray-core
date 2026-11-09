@@ -57,6 +57,9 @@ type Client struct {
 }
 
 // NewServer creates a name server object according to the network destination url.
+//
+// [改] ctx 必须携带 Xray 实例。需要后台任务(如 DoH 预热)与真实查询走同样路由时,
+// 调用方还应在 ctx 中写入 DNS 的 inbound tag(NewClient 已经这样做)。
 func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (Server, error) {
 	if address := dest.Address; address.Family().IsDomain() {
 		u, err := url.Parse(address.Domain())
@@ -67,13 +70,13 @@ func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 		case strings.EqualFold(u.String(), "localhost"):
 			return NewLocalNameServer(), nil
 		case strings.EqualFold(u.Scheme, "https"): // DNS-over-HTTPS Remote mode
-			return NewDoHNameServer(u, dispatcher, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return NewDoHNameServer(ctx, u, dispatcher, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil // [改]
 		case strings.EqualFold(u.Scheme, "h2c"): // DNS-over-HTTPS h2c Remote mode
-			return NewDoHNameServer(u, dispatcher, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return NewDoHNameServer(ctx, u, dispatcher, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil // [改]
 		case strings.EqualFold(u.Scheme, "https+local"): // DNS-over-HTTPS Local mode
-			return NewDoHNameServer(u, nil, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return NewDoHNameServer(ctx, u, nil, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil // [改]
 		case strings.EqualFold(u.Scheme, "h2c+local"): // DNS-over-HTTPS h2c Local mode
-			return NewDoHNameServer(u, nil, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return NewDoHNameServer(ctx, u, nil, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil // [改]
 		case strings.EqualFold(u.Scheme, "quic+local"): // DNS-over-QUIC Local mode
 			return NewQUICNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.Scheme, "tcp"): // DNS-over-TCP Remote mode
@@ -112,8 +115,13 @@ func NewClient(
 ) (*Client, error) {
 	client := &Client{id: ns.Id}
 	err := core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
+		// [改] 与 Client.QueryIP 写入的 inbound 完全一致(只有 Tag)。
+		// 传给 NewServer,使 DoH 的后台预热/网络切换重预热与真实查询走同样的路由,
+		// 并且 s.ctx 带有 Xray 实例,不再触发 MustFromContext 的 panic。
+		srvCtx := session.ContextWithInbound(ctx, &session.Inbound{Tag: tag})
+
 		// Create a new server for each client for now
-		server, err := NewServer(ctx, ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
+		server, err := NewServer(srvCtx, ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP) // [改] ctx -> srvCtx
 		if err != nil {
 			return errors.New("failed to create nameserver").Base(err)
 		}
