@@ -28,6 +28,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol/dns"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/utils"
+	"github.com/xtls/xray-core/core" // [改] 新增:dialViaDispatcher 兜底用
 	dns_feature "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport/internet"
@@ -87,6 +88,8 @@ type DoHNameServer struct {
 	conn     atomic.Pointer[dohConn] // 当前使用的 HTTP/2 连接池，可原子替换
 	inflight chan struct{}
 
+	// ctx 派生自构造时传入的 ctx：保留其中的 value（Xray 实例、inbound tag 等），
+	// 但不继承取消信号，生命周期只由 Close 控制。后台预热与网络切换重预热都以它为父级。
 	ctx       context.Context
 	cancel    context.CancelFunc
 	startOnce sync.Once
@@ -100,7 +103,10 @@ type DoHNameServer struct {
 }
 
 // NewDoHNameServer creates DOH/DOHL client object for remote/local resolving.
-func NewDoHNameServer(serverURL *url.URL, dispatcher routing.Dispatcher, h2c bool, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) *DoHNameServer {
+//
+// ctx 必须携带 Xray 实例（core.FromContext(ctx) != nil）；
+// 为使预热与真实查询走同样的路由，调用方还应在 ctx 中写入 DNS 的 inbound tag。
+func NewDoHNameServer(ctx context.Context, serverURL *url.URL, dispatcher routing.Dispatcher, h2c bool, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) *DoHNameServer { // [改] 新增 ctx 参数
 	// 复制 URL，避免修改调用方持有的对象
 	u := *serverURL
 	u.Scheme = "https"
@@ -109,9 +115,11 @@ func NewDoHNameServer(serverURL *url.URL, dispatcher routing.Dispatcher, h2c boo
 	if dispatcher == nil {
 		mode = "DOHL"
 	}
-	errors.LogInfo(context.Background(), "DNS: created ", mode, " client for ", u.String(), ", with h2c ", h2c)
+	errors.LogInfo(ctx, "DNS: created ", mode, " client for ", u.String(), ", with h2c ", h2c) // [改] context.Background() -> ctx
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// [改] 原为 context.WithCancel(context.Background())，丢失了 Xray 实例，
+	// 导致预热拨号时 core.ToBackgroundDetachedContext 的 MustFromContext panic。
+	sctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s := &DoHNameServer{
 		cacheController: NewCacheController(mode+"//"+u.Host, disableCache, serveStale, serveExpiredTTL),
 		dohURL:          u.String(),
@@ -120,7 +128,7 @@ func NewDoHNameServer(serverURL *url.URL, dispatcher routing.Dispatcher, h2c boo
 		dispatcher:      dispatcher,
 		h2c:             h2c,
 		inflight:        make(chan struct{}, dohMaxInflight),
-		ctx:             ctx,
+		ctx:             sctx,
 		cancel:          cancel,
 	}
 	s.conn.Store(s.newConn())
@@ -137,8 +145,15 @@ func (s *DoHNameServer) Start() {
 }
 
 // Warmup 预先建立 TLS + HTTP/2 连接。受去抖限制。
+//
+// [改] 调用方的 ctx 可能不带实例/inbound，因此 value 一律取自 s.ctx，
+// 仅把调用方 ctx 的取消信号转接过来。
 func (s *DoHNameServer) Warmup(ctx context.Context) {
-	s.warm(ctx, false)
+	wctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	s.warm(wctx, false)
 }
 
 // OnNetworkChanged 在网络切换时调用（如 Wi-Fi 与蜂窝之间切换、出口 IP 变化）。
@@ -186,6 +201,14 @@ func (s *DoHNameServer) warm(parent context.Context, force bool) {
 	}()
 
 	ctx = s.reqContext(ctx)
+
+	// [改] 记录预热实际使用的 inbound tag，便于核对预热与真实查询的路由是否一致
+	if in := session.InboundFromContext(ctx); in != nil {
+		errors.LogDebug(ctx, "DNS: warmup ", s.Name(), " using inbound tag ", in.Tag)
+	} else {
+		errors.LogDebug(ctx, "DNS: warmup ", s.Name(), " has no inbound in context")
+	}
+
 	msg := warmupMessage()
 	b, err := dns.PackMessage(&msg)
 	if err != nil {
@@ -274,6 +297,12 @@ func (s *DoHNameServer) dialTLS(ctx context.Context, network, addr string, _ *tl
 
 // dialViaDispatcher 通过 Xray 路由链路建立连接。
 func (s *DoHNameServer) dialViaDispatcher(ctx context.Context, dest net.Destination) (net.Conn, error) {
+	// [改] 兜底：此函数运行在 net/http 的拨号 goroutine 中，panic 无法被调用方 recover，
+	// 会直接使进程崩溃。拿不到实例时返回普通错误。
+	if core.FromContext(ctx) == nil {
+		return nil, errors.New("DoH dial context carries no xray instance")
+	}
+
 	dnsCtx := toDnsContext(ctx, s.dohURL)
 	if s.h2c {
 		dnsCtx = session.ContextWithMitmAlpn11(dnsCtx, false)
@@ -390,7 +419,9 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 }
 
-// reqContext 为请求附加 Content 信息（inbound 已包含在 parent 中）。查询与预热共用。
+// reqContext 为请求附加 Content 信息。查询与预热共用。
+// [改] 注释更正：parent 中的实例与 inbound 由调用方保证——
+// 普通查询来自 Client.QueryIP，预热来自 s.ctx（构造时已写入）。
 func (s *DoHNameServer) reqContext(parent context.Context) context.Context {
 	return session.ContextWithContent(parent, &session.Content{
 		Protocol:       "https",
