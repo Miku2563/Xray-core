@@ -27,6 +27,18 @@ type Server interface {
 	QueryIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error)
 }
 
+// startable 是可选的生命周期接口:只有实现了 Start() 的 nameserver(目前是 DoH)才会被调用。
+// UDP、TCP、Local、FakeDNS 等不受影响,Server 接口保持不变。
+// 注意:签名必须与实现方完全一致(无参),否则类型断言会静默失败。
+type startable interface {
+	Start()
+}
+
+// closable 是可选的关闭接口:实现了 Close() error 的 nameserver 会在 DNS 关闭时被调用。
+type closable interface {
+	Close() error
+}
+
 // Client is the interface for DNS client.
 type Client struct {
 	id            string
@@ -163,6 +175,29 @@ func NewClient(
 // Name returns the server name the client manages.
 func (c *Client) Name() string {
 	return c.server.Name()
+}
+
+// Start 在 DNS 特性启动阶段调用,转发给实现了 startable 的 nameserver(如 DoH 的预热与网络监听)。
+// 其他类型的 nameserver 不受影响。
+func (c *Client) Start() {
+	if c == nil || c.server == nil {
+		return
+	}
+	if s, ok := c.server.(startable); ok {
+		s.Start()
+	}
+}
+
+// Close 在 DNS 特性关闭时调用,转发给实现了 closable 的 nameserver
+// (DoH、UDP 会停止后台任务并释放资源)。
+func (c *Client) Close() error {
+	if c == nil || c.server == nil {
+		return nil
+	}
+	if s, ok := c.server.(closable); ok {
+		return s.Close()
+	}
+	return nil
 }
 
 // QueryIP sends DNS query to the name server with the client's IP.
