@@ -645,7 +645,8 @@ type SocketConfig struct {
 	AcceptProxyProtocol        bool                 `protobuf:"varint,7,opt,name=accept_proxy_protocol,json=acceptProxyProtocol,proto3" json:"accept_proxy_protocol,omitempty"`
 	DomainStrategy             DomainStrategy       `protobuf:"varint,8,opt,name=domain_strategy,json=domainStrategy,proto3,enum=xray.transport.internet.DomainStrategy" json:"domain_strategy,omitempty"`
 	DialerProxy                string               `protobuf:"bytes,9,opt,name=dialer_proxy,json=dialerProxy,proto3" json:"dialer_proxy,omitempty"`
-	TcpKeepAliveInterval       int32                `protobuf:"varint,10,opt,name=tcp_keep_alive_interval,json=tcpKeepAliveInterval,proto3" json:"tcp_keep_alive_interval,omitempty"`
+	TcpKeepAliveInterval       int32                `protobuf:"varint,10,opt,name=tcp_keep_alive_interval,json=tcpKeepAliveInterval,proto3" json:"tcp_keep_alive_interval,omitempty"`	
+    TcpKeepAliveCount          int32                `protobuf:"varint,41,opt,name=tcp_keep_alive_count,json=tcpKeepAliveCount,proto3" json:"tcp_keep_alive_count,omitempty"`
 	TcpKeepAliveIdle           int32                `protobuf:"varint,11,opt,name=tcp_keep_alive_idle,json=tcpKeepAliveIdle,proto3" json:"tcp_keep_alive_idle,omitempty"`
 	TcpCongestion              string               `protobuf:"bytes,12,opt,name=tcp_congestion,json=tcpCongestion,proto3" json:"tcp_congestion,omitempty"`
 	Interface                  string               `protobuf:"bytes,13,opt,name=interface,proto3" json:"interface,omitempty"`
