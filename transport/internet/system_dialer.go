@@ -135,7 +135,7 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 			keepAliveConfig.Interval = time.Duration(sockopt.TcpKeepAliveInterval) * time.Second
 		}
 		if sockopt.TcpKeepAliveCount > 0 {
-	keepAliveConfig.Count = int(sockopt.TcpKeepAliveCount)
+	        keepAliveConfig.Count = int(sockopt.TcpKeepAliveCount)
         }
 	}
 	dialer := &net.Dialer{
