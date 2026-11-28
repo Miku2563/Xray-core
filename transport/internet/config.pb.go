@@ -759,7 +759,7 @@ func (x *SocketConfig) GetTcpKeepAliveIdle() int32 {
 
 func (x *SocketConfig) GetTcpKeepAliveCount() int32 {
 	if x != nil {
-		return x.TcpKeepAliveIdle
+		return x.TcpKeepAliveCount
 	}
 	return 0
 }
