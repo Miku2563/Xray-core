@@ -757,6 +757,13 @@ func (x *SocketConfig) GetTcpKeepAliveIdle() int32 {
 	return 0
 }
 
+func (x *SocketConfig) GetTcpKeepAliveCount() int32 {
+	if x != nil {
+		return x.TcpKeepAliveIdle
+	}
+	return 0
+}
+
 func (x *SocketConfig) GetTcpCongestion() string {
 	if x != nil {
 		return x.TcpCongestion
